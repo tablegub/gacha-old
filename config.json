@@ -1,0 +1,11 @@
+{
+    "channels": {
+        "ch1": [732, 189],
+        "ch2": [748, 309],
+        "ch3": [741, 434],
+        "ch4": [748, 338],
+        "ch5": [754, 428]
+    },
+    "channel": "ch3",
+    "filename_prefix": "ouwlawboss"
+}
