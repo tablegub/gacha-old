@@ -1,0 +1,1542 @@
+from ppadb.client import Client as AdbClient
+import cv2
+import numpy as np
+import time
+from threading import Thread, Event, Lock
+import os
+import subprocess
+from queue import Queue
+import time
+import random
+import os
+import datetime
+import getpass
+import glob
+from datetime import datetime, timezone  # แก้ไขการ import
+import json
+import hashlib
+import gc
+
+
+class DeviceState:
+    def __init__(self):
+        self.lock = Lock()
+        self.devices_status = {}  # เก็บสถานะของแต่ละอุปกรณ์
+        self.file_queue = Queue()  # คิวสำหรับเก็บไฟล์ที่รอการประมวลผล
+        self.processed_files = set()  # เก็บรายชื่อไฟล์ที่ประมวลผลแล้ว
+        self.original_filenames = {}  # เก็บชื่อไฟล์ต้นฉบับของแต่ละอุปกรณ์
+
+device_state = DeviceState()
+
+
+def update_file_queue():
+    """อัพเดทคิวไฟล์จาก source_folder"""
+    try:
+        xml_files = [f for f in os.listdir(source_folder) if f.endswith('.xml')]
+        with device_state.lock:
+            for xml_file in xml_files:
+                if xml_file not in device_state.processed_files:
+                    device_state.file_queue.put(xml_file)
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการอัพเดทคิวไฟล์: {e}")
+
+def get_next_backup_id():
+    """
+    Get the next available backup ID by checking existing backup files in backup-id directory
+    Returns the next sequential number for backup naming
+    """
+    # โหลด config
+    try:
+        with open('config.json', 'r') as f:
+            config = json.load(f)
+        filename_prefix = config.get('filename_prefix', 'conyfly')  # ใช้ค่าเริ่มต้นเป็น 'conyfly' ถ้าไม่มีในconfig
+    except:
+        filename_prefix = 'conyfly'  # ใช้ค่าเริ่มต้นถ้าไม่สามารถโหลด config ได้
+    
+    backup_dir = "backup-id"
+    if not os.path.exists(backup_dir):
+        os.makedirs(backup_dir)
+        return 1, filename_prefix
+        
+    # Get list of all backup files ใช้ filename_prefix จาก config
+    existing_files = glob.glob(os.path.join(backup_dir, f"{filename_prefix}-id*_LINE_COCOS_PREF_KEY_*.xml"))
+    
+    if not existing_files:
+        return 1, filename_prefix
+        
+    # Extract IDs from filenames and find the highest one
+    ids = []
+    for file in existing_files:
+        try:
+            # Extract ID from filename using the dynamic prefix
+            id_part = file.split(f"{filename_prefix}-id")[1].split("_")[0]
+            if id_part.isdigit():
+                ids.append(int(id_part))
+        except:
+            continue
+            
+    if not ids:
+        return 1, filename_prefix
+        
+    return max(ids) + 1, filename_prefix
+
+def get_backup_folder():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    backup_path = os.path.join(current_dir, "backup", "backupxml")
+    
+    if not os.path.exists(backup_path):
+        try:
+            os.makedirs(backup_path)
+            print(f"Created backup folder at: {backup_path}")
+        except Exception as e:
+            print(f"Error creating backup folder: {e}")
+    
+    return backup_path
+
+source_folder = get_backup_folder()
+
+def has_xml_files():
+    try:
+        xml_files = [f for f in os.listdir(source_folder) if f.endswith('.xml')]
+        return len(xml_files) > 0
+    except FileNotFoundError:
+        return False
+
+def clear_app(device):
+    try:
+        time.sleep(1)
+        
+        device.shell("am force-stop com.google.android.googlequicksearchbox")
+        print(f"หยุดแอป Google บนอุปกรณ์ {device.serial} สำเร็จ")
+        time.sleep(0.5)
+
+        device.shell("am force-stop com.android.browser")
+        print(f"หยุดแอป Browser บนอุปกรณ์ {device.serial} สำเร็จ")
+        time.sleep(0.5)
+        
+        device.shell("am force-stop com.linecorp.LGRGS")
+        print(f"หยุดแอป Line Ranger บนอุปกรณ์ {device.serial} สำเร็จ")
+        time.sleep(0.5)
+               
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการหยุดแอปบนอุปกรณ์ {device.serial}: {e}")
+        try:
+            time.sleep(1)
+            device.shell("am force-stop com.linecorp.LGRGS")
+            print(f"พยายามหยุดแอป Line Ranger อีกครั้งบนอุปกรณ์ {device.serial} สำเร็จ")
+        except Exception as retry_error:
+            print(f"ไม่สามารถหยุดแอปในการพยายามครั้งที่สองบนอุปกรณ์ {device.serial}: {retry_error}")
+
+def check_adb_available():
+    try:
+        result = subprocess.run(["adb", "version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode == 0:
+            print("พบ ADB และพร้อมใช้งาน")
+            return True
+        else:
+            print("ไม่พบ ADB หรือไม่สามารถเรียกใช้งานได้")
+            print("กรุณาตรวจสอบการติดตั้ง ADB และเพิ่มลงใน PATH")
+            return False
+    except FileNotFoundError:
+        print("ไม่พบคำสั่ง ADB ในระบบ")
+        print("กรุณาติดตั้ง ADB และเพิ่มลงใน PATH")
+        return False
+
+def find_mumu_ports():
+    try:
+        mumu_ports = []
+        for port in range(21503, 21514):
+            result = subprocess.run(
+                ["adb", "connect", f"127.0.0.1:{port}"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if "connected" in result.stdout or "already connected" in result.stdout:
+                mumu_ports.append(port)
+        return mumu_ports
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการค้นหา ports ของ MuMu: {e}")
+        return []
+    
+    
+    
+
+def process_swap_shop(device):
+    """ฟังก์ชันสำหรับประมวลผล swap shop และจัดการการ backup"""
+    print(f"\nเริ่มกระบวนการ swap shop สำหรับอุปกรณ์: {device.serial}")
+    
+    # แสดงเวลาและผู้ใช้งาน
+    current_time = "2025-05-17 07:55:43"  # UTC time
+    print(f"Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {current_time}")
+    print(f"Current User's Login: leokungYT")
+    
+    # ตัวแปรควบคุมการทำงาน
+    found_initial_swap_shop = False
+    checked_waitgacha = False
+    running = True
+    first_sequence_position = 0
+    second_sequence_position = 0
+    
+    # ตัวแปรติดตามการคลิกและภาพ
+    last_click_position = None
+    last_image_hash = None
+    last_image_time = time.time()
+    
+    # ตัวแปรติดตาม stopgacha4
+    stopgacha4_last_seen = None
+    stopgacha4_last_position = None
+
+    # ตัวแปรสำหรับติดตาม gachafix.png
+    gachafix_last_seen = None
+    gachafix_seen_duration = 0
+    
+    def get_image_hash(adb_img):
+        """สร้าง hash อย่างง่ายสำหรับภาพ"""
+        return hashlib.md5(adb_img.tobytes()).hexdigest()
+
+    def get_channel_position():
+        """อ่านตำแหน่งช่องจาก config.json"""
+        try:
+            with open('config.json', 'r') as f:
+                config = json.load(f)
+                selected_channel = config.get('channel', 'ch2')
+                
+                # เพิ่มเงื่อนไขสำหรับช่อง 4 และ 5
+                if selected_channel in ['ch4', 'ch5']:
+                    print(f"เลือกช่อง {selected_channel} - เลื่อนหน้าจอขึ้นก่อน")
+                    device.shell(f"input swipe 852 316 855 116 600")
+                    time.sleep(1)  # รอให้การเลื่อนเสร็จสิ้น
+                    return config['channels'][selected_channel]  # ส่งค่าตำแหน่งตามที่กำหนดใน config
+                
+                return config['channels'][selected_channel]
+        except Exception as e:
+            print(f"ไม่สามารถโหลด config.json: {e}")
+            return None
+
+    def check_new_soldier_brown(device):
+        """ตรวจสอบการปรากฏของ New Soldier Brown"""
+        try:
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            
+            if "Floating BROWN" in device.shell("uiautomator dump /dev/tty"):
+                print(f"พบ New Soldier Brown บนอุปกรณ์ {device.serial}")
+                print(f"กำลังพัก 24 ชั่วโมง...")
+                time.sleep(86400)  # 24 ชั่วโมง
+                return True
+            return False
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาดในการตรวจสอบ New Soldier Brown: {e}")
+            return False
+
+    # เริ่มต้นด้วยการกด event.png
+    print(f"เริ่มต้นด้วยการค้นหา event.png บนอุปกรณ์ {device.serial}")
+    cap = device.screencap()
+    image = np.frombuffer(cap, dtype=np.uint8)
+    adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+    event_pos = ImgSearchADB(adb_img, 'img/event.png')
+    if event_pos:
+        print(f"กด event.png เริ่มต้นบนอุปกรณ์ {device.serial}")
+        device.shell(f"input tap {event_pos[0][0]} {event_pos[0][1]}")
+        last_click_position = event_pos[0]
+        time.sleep(1)
+    
+    while running:
+        try:
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            current_time = time.time()
+            
+            # ตรวจสอบ stopgacha4.png เป็นพิเศษ
+            stopgacha4_pos = ImgSearchADB(adb_img, 'img/stopgacha4.png')
+            if stopgacha4_pos:
+                if stopgacha4_last_seen is None:
+                    stopgacha4_last_seen = current_time
+                    stopgacha4_last_position = stopgacha4_pos[0]
+                elif current_time - stopgacha4_last_seen >= 15:  # 15 วินาที
+                    print(f"\nตรวจพบ stopgacha4.png ค้างนานเกิน 15 วินาที บนอุปกรณ์ {device.serial}")
+                    print("ลองคลิกใหม่อีกครั้ง...")
+                    # คลิกที่ตำแหน่งเดิม
+                    device.shell(f"input tap {stopgacha4_last_position[0]} {stopgacha4_last_position[1]}")
+                    time.sleep(1)
+                    # คลิกที่ตำแหน่งปัจจุบัน
+                    device.shell(f"input tap {stopgacha4_pos[0][0]} {stopgacha4_pos[0][1]}")
+                    stopgacha4_last_seen = current_time
+                    stopgacha4_last_position = stopgacha4_pos[0]
+            else:
+                stopgacha4_last_seen = None
+                stopgacha4_last_position = None
+
+            # ตรวจสอบ gachafix.png
+            gachafix_pos = ImgSearchADB(adb_img, 'img/gachafix.png')
+            if gachafix_pos:
+                if gachafix_last_seen is None:
+                    gachafix_last_seen = current_time
+                    print(f"\nเริ่มพบ gachafix.png บนอุปกรณ์ {device.serial}")
+                else:
+                    gachafix_seen_duration = current_time - gachafix_last_seen
+                    if gachafix_seen_duration >= 20:  # ครบ 20 วินาที
+                        print(f"\nพบ gachafix.png ค้างนาน {gachafix_seen_duration:.1f} วินาที บนอุปกรณ์ {device.serial}")
+                        print("กำลังค้นหา stopgacha6.png เพื่อแก้ไข...")
+                        
+                        # ค้นหาและกด stopgacha6.png
+                        stopgacha6_pos = ImgSearchADB(adb_img, 'img/stopgacha6.png')
+                        if stopgacha6_pos:
+                            print(f"พบและกด stopgacha6.png บนอุปกรณ์ {device.serial}")
+                            device.shell(f"input tap {stopgacha6_pos[0][0]} {stopgacha6_pos[0][1]}")
+                            last_click_position = stopgacha6_pos[0]
+                            time.sleep(1)
+                        
+                        # รีเซ็ตตัวแปรติดตาม gachafix
+                        gachafix_last_seen = None
+                        gachafix_seen_duration = 0
+                    else:
+                        # แสดงสถานะทุก 5 วินาที
+                        if int(gachafix_seen_duration) % 5 == 0:
+                            print(f"gachafix.png ค้างมาแล้ว {gachafix_seen_duration:.1f} วินาที บนอุปกรณ์ {device.serial}")
+            else:
+                # รีเซ็ตเมื่อไม่พบ gachafix.png
+                gachafix_last_seen = None
+                gachafix_seen_duration = 0
+            
+            # ตรวจสอบการเปลี่ยนแปลงของภาพทั่วไป
+            current_hash = get_image_hash(adb_img)
+            if current_hash == last_image_hash:
+                if current_time - last_image_time >= 1800:  # 30 นาที
+                    print("ตรวจพบภาพเดิมนานเกิน 30 นาที - ลองคลิกใหม่")
+                    if last_click_position:
+                        device.shell(f"input tap {last_click_position[0]} {last_click_position[1]}")
+                        time.sleep(1)
+                    last_image_time = current_time
+            else:
+                last_image_hash = current_hash
+                last_image_time = current_time
+            
+            # 1. ตรวจสอบ hero1.png
+            hero_pos = ImgSearchADB(adb_img, 'img/hero1.png')
+            if hero_pos:
+                print(f"\nพบ hero1.png บนอุปกรณ์ {device.serial} - ดำเนินการ backup ทันที")
+                backup_result = backup_game_data(device)
+                if backup_result:
+                    print(f"Backup สำเร็จสำหรับอุปกรณ์ {device.serial}")
+                    clear_app(device)
+                    time.sleep(5)
+                    return "backup_complete"
+                else:
+                    print(f"Backup ล้มเหลวสำหรับอุปกรณ์ {device.serial}")
+                    time.sleep(5)
+                    continue
+            
+            # 2. ตรวจสอบ New Soldier Brown
+            if check_new_soldier_brown(device):
+                continue
+            
+            # 3. ตรวจสอบ stopgacha5, stopgacha7, และ stopgacha8
+            for stop_img in ['stopgacha5.png', 'stopgacha7.png', 'stopgacha8.png']:
+                stop_pos = ImgSearchADB(adb_img, f'img/{stop_img}')
+                if stop_pos:
+                    print(f"\nพบ {stop_img} - จบการทำงาน")
+                    current_time = "2025-05-17 07:55:43"  # UTC time
+                    print(f"End Time (UTC): {current_time}")
+                    event_pos = ImgSearchADB(adb_img, 'img/event.png')
+                    if event_pos:
+                        device.shell(f"input tap {event_pos[0][0]} {event_pos[0][1]}")
+                        last_click_position = event_pos[0]
+                        time.sleep(1)
+                    return "complete"
+
+            # 4. ค้นหา gacha.png
+            if not found_initial_swap_shop:
+                swap_shop_pos = ImgSearchADB(adb_img, 'img/gacha.png')
+                if swap_shop_pos:
+                    print(f"พบและกด gacha.png บนอุปกรณ์ {device.serial}")
+                    device.shell(f"input tap {swap_shop_pos[0][0]} {swap_shop_pos[0][1]}")
+                    last_click_position = swap_shop_pos[0]
+                    found_initial_swap_shop = True
+                    time.sleep(1)
+                    continue
+
+            # 5. ตรวจสอบ waitgacha.png และเลือกช่อง
+            if not checked_waitgacha:
+                wait_pos = ImgSearchADB(adb_img, 'img/waitgacha.png')
+                if wait_pos:
+                    print(f"พบ waitgacha.png บนอุปกรณ์ {device.serial}")
+                    checked_waitgacha = True
+                    
+                    print("รอ 3 วินาทีก่อนเลือกช่อง...")
+                    time.sleep(3)
+                    
+                    channel_pos = get_channel_position()
+                    if channel_pos:
+                        print(f"กำลังเลือกช่องที่ตำแหน่ง: {channel_pos}")
+                        device.shell(f"input tap {channel_pos[0]} {channel_pos[1]}")
+                        last_click_position = channel_pos
+                        time.sleep(1)
+                    else:
+                        print("ไม่สามารถโหลดตำแหน่งช่องได้ กรุณาตรวจสอบไฟล์ config.json")
+                        return "config_error"
+                    
+                    continue
+                else:
+                    print(f"รอ waitgacha.png บนอุปกรณ์ {device.serial}")
+                    time.sleep(1)
+                    continue
+
+            # 6. ชุดที่ 1: ทำงานตามลำดับ
+            if first_sequence_position < 3:
+                purchase_sequence = ['stopgacha.png', 'stopgacha1.png', 'stopgacha2.png']
+                current_img = purchase_sequence[first_sequence_position]
+                
+                pos = ImgSearchADB(adb_img, f'img/{current_img}')
+                if pos:
+                    print(f"พบและกด {current_img} บนอุปกรณ์ {device.serial}")
+                    device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
+                    last_click_position = pos[0]
+                    first_sequence_position += 1
+                    time.sleep(1)
+                    
+                    if current_img == 'stopgacha2.png':
+                        print(f"จบชุดแรก เริ่มชุดที่ 2 ทันทีสำหรับอุปกรณ์ {device.serial}")
+                        first_sequence_position = 3
+                    continue
+
+            # 7. ชุดที่ 2: ทำงานตามลำดับ
+            second_sequence = ['stopgacha4.png', 'stopgacha6.png', 'stopgacha2.png']
+            if second_sequence_position < len(second_sequence):
+                current_img = second_sequence[second_sequence_position]
+                
+                pos = ImgSearchADB(adb_img, f'img/{current_img}')
+                if pos:
+                    print(f"พบและกด {current_img} บนอุปกรณ์ {device.serial}")
+                    device.shell(f"input tap {pos[0][0]} {pos[0][1]}")
+                    last_click_position = pos[0]
+                    
+                    if current_img == 'stopgacha4.png':
+                        stopgacha4_last_seen = current_time
+                        stopgacha4_last_position = pos[0]
+                    
+                    second_sequence_position += 1
+                    time.sleep(1)
+                    
+                    if second_sequence_position >= len(second_sequence):
+                        second_sequence_position = 0
+                        print(f"เริ่มชุดที่ 2 ใหม่สำหรับอุปกรณ์ {device.serial}")
+
+            # 8. แสดงสถานะทุก 30 วินาที
+            if time.time() % 30 < 1:
+                current_time = "2025-05-17 07:55:43"  # UTC time
+                print(f"\nStatus Update (UTC): {current_time}")
+                print(f"Device: {device.serial}")
+                print(f"Current Position: Sequence 1 - {first_sequence_position}/3, Sequence 2 - {second_sequence_position}/3")
+                if stopgacha4_last_seen:
+                    time_waiting = time.time() - stopgacha4_last_seen
+                    print(f"Stopgacha4 waiting time: {time_waiting:.1f} seconds")
+
+            # 9. ทำ Garbage Collection ทุก 5 นาที
+            if time.time() % 300 < 1:
+                gc.collect()
+
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาด: {e}")
+            time.sleep(1)
+    
+    return "complete"
+
+
+def connect_mumu_devices():
+    mumu_ports = find_mumu_ports()
+    connected_devices = []
+    
+    for port in mumu_ports:
+        try:
+            device_serial = f"127.0.0.1:{port}"
+            result = subprocess.run(
+                ["adb", "connect", device_serial],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            if "connected" in result.stdout or "already connected" in result.stdout:
+                connected_devices.append(device_serial)
+                print(f"เชื่อมต่อกับ MuMu port {port} สำเร็จ")
+        except Exception as e:
+            print(f"ไม่สามารถเชื่อมต่อกับ MuMu port {port}: {e}")
+    
+    return connected_devices
+
+def enable_root(device):
+    try:
+        adb_command = f"adb -s {device.serial} root"
+        result = subprocess.run(adb_command.split(), stdout=subprocess.PIPE, text=True)
+        print(f"เปิดใช้งาน root สำหรับ {device.serial}: {result.stdout.strip()}")
+    except Exception as e:
+        print(f"ไม่สามารถเปิดใช้งาน root สำหรับ {device.serial}: {e}")
+
+def ImgSearchADB(adb_img, find_img_path, threshold=0.95, method=cv2.TM_CCOEFF_NORMED):
+    try:
+        find_img = cv2.imread(find_img_path, cv2.IMREAD_COLOR)
+        if find_img is None:
+            print(f"ไม่สามารถโหลดรูปภาพ {find_img_path}")
+            return []
+        
+        needle_w = find_img.shape[1]
+        needle_h = find_img.shape[0]
+        result = cv2.matchTemplate(adb_img, find_img, method)
+        locations = np.where(result >= threshold)
+        locations = list(zip(*locations[::-1]))
+        rectangles = []
+        for loc in locations:
+            rect = [int(loc[0]), int(loc[1]), needle_w, needle_h]
+            rectangles.append(rect)
+            rectangles.append(rect)
+        rectangles, _ = cv2.groupRectangles(rectangles, groupThreshold=1, eps=1)
+        points = []
+        if len(rectangles):
+            for (x, y, w, h) in rectangles:
+                center_x = x + int(w / 2)
+                center_y = y + int(h / 2)
+                points.append((center_x, center_y))
+        return points
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการค้นหารูปภาพ: {e}")
+        return []
+
+
+def func_7day(device):
+    print(f"กำลังตรวจสอบกิจกรรม 7 วันสำหรับอุปกรณ์: {device.serial}")
+    
+    # ค้นหา 7day.png ก่อน
+    for attempt in range(3):
+        try:
+            print(f"\nกำลังค้นหา 7day.png (พยายามครั้งที่ {attempt + 1}/3)")
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            
+            pos_adb = ImgSearchADB(adb_img, 'img/7day.png')
+            if pos_adb:
+                print(f"พบ '7day.png' ที่ตำแหน่ง: {pos_adb[0][0]}, {pos_adb[0][1]}")
+                device.shell(f"input tap {pos_adb[0][0]} {pos_adb[0][1]}")
+                time.sleep(1)
+                break
+            time.sleep(1)
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาด: {e}")
+            time.sleep(1)
+
+    # วนลูปค้นหา 7day1.png และ ok.png
+    no_7day1_count = 0  # นับจำนวนครั้งที่ไม่เจอ 7day1
+    max_no_find = 3     # จำนวนครั้งที่ต้องไม่เจอ 7day1 ติดต่อกันถึงจะออกจากลูป
+    
+    while True:
+        try:
+            print("\nกำลังค้นหา 7day1.png...")
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            
+            pos_7day1 = ImgSearchADB(adb_img, 'img/7day1.png')
+            
+            if pos_7day1:
+                print(f"พบ '7day1.png' ที่ตำแหน่ง: {pos_7day1[0][0]}, {pos_7day1[0][1]}")
+                device.shell(f"input tap {pos_7day1[0][0]} {pos_7day1[0][1]}")
+                time.sleep(1)
+                
+                # ค้นหาและกด ok.png
+                print("กำลังค้นหา ok.png...")
+                cap = device.screencap()
+                image = np.frombuffer(cap, dtype=np.uint8)
+                adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                
+                pos_ok = ImgSearchADB(adb_img, 'img/ok.png')
+                if pos_ok:
+                    print(f"พบ 'ok.png' ที่ตำแหน่ง: {pos_ok[0][0]}, {pos_ok[0][1]}")
+                    device.shell(f"input tap {pos_ok[0][0]} {pos_ok[0][1]}")
+                    time.sleep(1)
+                
+                no_7day1_count = 0  # รีเซ็ตตัวนับเมื่อเจอ 7day1
+            else:
+                print("ไม่พบ 7day1.png")
+                no_7day1_count += 1
+                if no_7day1_count >= max_no_find:
+                    print(f"ไม่พบ 7day1.png ติดต่อกัน {max_no_find} ครั้ง - เริ่มค้นหา 7day2.png")
+                    break
+                time.sleep(1)
+                
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาด: {e}")
+            time.sleep(1)
+
+    # ค้นหา 7day2.png
+    for attempt in range(3):
+        try:
+            print(f"\nกำลังค้นหา 7day2.png (พยายามครั้งที่ {attempt + 1}/3)")
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            
+            pos_7day2 = ImgSearchADB(adb_img, 'img/7day2.png')
+            if pos_7day2:
+                print(f"พบ '7day2.png' ที่ตำแหน่ง: {pos_7day2[0][0]}, {pos_7day2[0][1]}")
+                device.shell(f"input tap {pos_7day2[0][0]} {pos_7day2[0][1]}")
+                time.sleep(1)
+                break
+            time.sleep(1)
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาด: {e}")
+            time.sleep(1)
+
+    # สุดท้ายค้นหาและกด event.png
+    for attempt in range(3):
+        try:
+            print(f"\nกำลังค้นหา event.png (พยายามครั้งที่ {attempt + 1}/3)")
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            
+            pos_event = ImgSearchADB(adb_img, 'img/event.png')
+            if pos_event:
+                print(f"พบ 'event.png' ที่ตำแหน่ง: {pos_event[0][0]}, {pos_event[0][1]}")
+                device.shell(f"input tap {pos_event[0][0]} {pos_event[0][1]}")
+                time.sleep(1)
+                break
+            time.sleep(1)
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาด: {e}")
+            time.sleep(1)
+
+    print(f"ตรวจสอบกิจกรรม 7 วันเสร็จสิ้นสำหรับอุปกรณ์ {device.serial}")
+
+def adaptive_delay(device, base_delay=1):
+    """ฟังก์ชันหน่วงเวลาแบบปรับได้"""
+    try:
+        cpu_info = device.shell("cat /proc/stat")
+        if "cpu" in cpu_info.lower():  # ถ้าสามารถอ่านข้อมูล CPU ได้
+            # ปรับเวลาหน่วงตามการใช้งาน CPU
+            time.sleep(base_delay * 1.5)
+        else:
+            time.sleep(base_delay)
+    except:
+        time.sleep(base_delay)
+        
+def cleanup_memory():
+    """ฟังก์ชันทำความสะอาดหน่วยความจำ"""
+    import gc
+    gc.collect()
+    
+def transition_to_next_phase(device):
+    """ฟังก์ชันสำหรับเปลี่ยนผ่านไปยังขั้นตอนถัดไป"""
+    cleanup_memory()
+    print(f"\nเริ่มเปลี่ยนผ่านไปยังขั้นตอนถัดไปสำหรับอุปกรณ์ {device.serial}")
+    adaptive_delay(device, 0.5)
+
+def check_cpu_usage(device):
+    """ฟังก์ชันตรวจสอบการใช้งาน CPU"""
+    try:
+        cpu_info = device.shell("dumpsys cpuinfo | grep TOTAL")
+        if "TOTAL" in cpu_info:
+            total_cpu = float(cpu_info.split("%")[0].strip().split()[-1])
+            return total_cpu
+    except:
+        return None
+    return None
+
+def smart_transition(device):
+    """ฟังก์ชันเปลี่ยนผ่านอย่างฉลาด"""
+    cpu_usage = check_cpu_usage(device)
+    if cpu_usage is not None:
+        if cpu_usage > 80:
+            time.sleep(2)  # รอนานขึ้นถ้า CPU สูง
+        elif cpu_usage > 50:
+            time.sleep(1)  # รอปานกลาง
+        else:
+            time.sleep(0.5)  # รอน้อยถ้า CPU ต่ำ
+    else:
+        adaptive_delay(device)
+        
+
+
+def main_box(device):
+    print(f"เริ่มลำดับการกดกล่องสำหรับอุปกรณ์: {device.serial}")
+    
+    def check_first_round_boxes():
+        print(f"กำลังตรวจสอบกล่องรอบแรกสำหรับอุปกรณ์: {device.serial}")
+        image_sequence = ['box1.png', 'box2.png', 'box3.png', 'box4.png', 'box5.png']
+        sequence_index = 0
+        start_time = time.time()
+        timeout = 30
+        
+        while sequence_index < len(image_sequence):
+            try:
+                current_time = time.time()
+                if current_time - start_time > timeout:
+                    print(f"หมดเวลาสำหรับอุปกรณ์ {device.serial} กำลังคลิก event.png")
+                    cap = device.screencap()
+                    image = np.frombuffer(cap, dtype=np.uint8)
+                    adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                    event_pos = ImgSearchADB(adb_img, 'img/event.png')
+                    if event_pos:
+                        device.shell(f"input tap {event_pos[0][0]} {event_pos[0][1]}")
+                    return False
+                
+                print(f"กำลังค้นหา {image_sequence[sequence_index]} บนอุปกรณ์ {device.serial}")
+                cap = device.screencap()
+                image = np.frombuffer(cap, dtype=np.uint8)
+                adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                
+                pos_adb = ImgSearchADB(adb_img, f'img/{image_sequence[sequence_index]}')
+                if pos_adb:
+                    print(f"พบ '{image_sequence[sequence_index]}' บนอุปกรณ์ {device.serial} ที่ตำแหน่ง: {pos_adb[0][0]}, {pos_adb[0][1]}")
+                    device.shell(f"input tap {pos_adb[0][0]} {pos_adb[0][1]}")
+                    sequence_index += 1
+                    time.sleep(1)
+                else:
+                    time.sleep(1)
+                    
+            except Exception as e:
+                print(f"เกิดข้อผิดพลาด: {e}")
+                time.sleep(2)
+        return True
+
+    def check_box1():
+        try:
+            print(f"กำลังค้นหา box1.png บนอุปกรณ์ {device.serial}")
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            
+            pos_adb = ImgSearchADB(adb_img, 'img/box1.png')
+            if pos_adb:
+                print(f"พบ 'box1.png' บนอุปกรณ์ {device.serial} ที่ตำแหน่ง: {pos_adb[0][0]}, {pos_adb[0][1]}")
+                device.shell(f"input tap {pos_adb[0][0]} {pos_adb[0][1]}")
+                time.sleep(1)
+                return True
+            return False
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาด: {e}")
+            time.sleep(2)
+            return False
+
+    def check_accept_and_tap():
+        try:
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            
+            accept_pos = ImgSearchADB(adb_img, 'img/accept.png')
+            
+            if accept_pos:
+                print(f"พบ accept.png บนอุปกรณ์ {device.serial} ที่ตำแหน่ง: {accept_pos[0][0]}, {accept_pos[0][1]}")
+                device.shell(f"input tap {accept_pos[0][0]} {accept_pos[0][1]}")
+                time.sleep(2)
+                
+                for i in range(2):
+                    print(f"กำลังแตะตำแหน่ง 469 352 ครั้งที่ {i+1}")
+                    device.shell("input tap 469 352")
+                    time.sleep(0.5)
+                
+                for i in range(5):
+                    print(f"กำลังแตะตำแหน่ง 504 464 ครั้งที่ {i+1}")
+                    device.shell("input tap 504 464")
+                    time.sleep(0.5)
+                
+                return True
+            else:
+                print("ไม่พบ accept.png - กำลังเลื่อนหน้าจอขึ้น")
+                device.shell(f"input swipe 613 296 616 251 100")
+                time.sleep(1)
+                
+                cap = device.screencap()
+                image = np.frombuffer(cap, dtype=np.uint8)
+                adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                accept_pos = ImgSearchADB(adb_img, 'img/accept.png')
+                
+                if accept_pos:
+                    print(f"พบ accept.png หลังเลื่อนหน้าจอ ที่ตำแหน่ง: {accept_pos[0][0]}, {accept_pos[0][1]}")
+                    return True
+                
+                return False
+                
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาด: {e}")
+            time.sleep(2)
+            return False
+
+    # เริ่มการทำงานหลัก
+    try:
+        print("เริ่มการทำงานรอบแรก...")
+        if not check_first_round_boxes():
+            return  # แค่ return ออกไปเฉยๆ ไม่ต้อง clear_app
+        time.sleep(2)
+        
+        print("เริ่มการทำงานรอบถัดไป...")
+        no_accept_count = 0
+        
+        while True:
+            check_box1()
+            time.sleep(2)
+            
+            if check_accept_and_tap():
+                time.sleep(2)
+                no_accept_count = 0  # รีเซ็ตตัวนับเมื่อเจอ accept
+                continue
+            else:
+                no_accept_count += 1
+                if no_accept_count >= 3:
+                    print(f"ไม่พบ accept 3 ครั้งติดต่อกัน - จบกระบวนการสำหรับอุปกรณ์ {device.serial}")
+                    return  # แค่ return ออกไปเฉยๆ ไม่ต้อง clear_app
+                else:
+                    print(f"ไม่พบ accept ครั้งที่ {no_accept_count}")
+                    continue
+            
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการทำงาน: {e}")
+        return  # แค่ return ออกไปเฉยๆ ไม่ต้อง clear_app
+
+
+def main_login(device):
+    print(f"เริ่มการล็อกอินสำหรับอุปกรณ์: {device.serial}")
+    
+    # ตัวแปรสำหรับติดตามสถานะ
+    stoplogin_count = 0
+    fixbug_timer = None
+    no_image_timer = None
+    fixid_count = 0
+    back_press_mode = False
+    
+    # ตัวแปรสำหรับติดตามการเจอรูปซ้ำ
+    last_image = None
+    repeat_count = {}  # dictionary เก็บจำนวนครั้งที่เจอรูปแต่ละประเภทซ้ำ
+    max_repeat = 3    # จำนวนครั้งสูงสุดที่ยอมให้เจอรูปซ้ำ
+    
+    while True:
+        try:
+            cap = device.screencap()
+            image = np.frombuffer(cap, dtype=np.uint8)
+            adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+            
+            found_any_image = False
+            current_image = None
+
+            # 1. ตรวจสอบ stoplogin.png (สำคัญที่สุด - ถ้าเจอถือว่าล็อกอินสำเร็จ)
+            stoplogin_pos = ImgSearchADB(adb_img, 'img/stoplogin.png')
+            if stoplogin_pos:
+                found_any_image = True
+                stoplogin_count += 1
+                print(f"พบ stoplogin บนอุปกรณ์ {device.serial} - ครั้งที่: {stoplogin_count}")
+                if stoplogin_count >= 1:
+                    print(f"ล็อกอินสำเร็จสำหรับอุปกรณ์ {device.serial}")
+                    return "normal_complete"
+                continue
+
+            # 2. ตรวจสอบ alert1.png (ต้องจัดการทันทีถ้าเจอ)
+            alert1_pos = ImgSearchADB(adb_img, 'img/alert1.png')
+            if alert1_pos:
+                found_any_image = True
+                current_image = 'alert1.png'
+                print(f"พบ alert1.png บนอุปกรณ์ {device.serial}")
+                clear_app(device)
+                time.sleep(1)
+                continue
+
+            # 3. ตรวจสอบ fixid.png (สำคัญรองลงมา)
+            fixid_pos = ImgSearchADB(adb_img, 'img/fixid.png')
+            if fixid_pos:
+                found_any_image = True
+                current_image = 'fixid.png'
+                fixid_count += 1
+                print(f"พบ fixid บนอุปกรณ์ {device.serial} - ครั้งที่: {fixid_count}")
+                if fixid_count >= 8:
+                    print(f"พบ fixid.png ครบ 8 ครั้งบนอุปกรณ์ {device.serial}")
+                    print(f"กำลังเคลียร์แอปและเริ่มกระบวนการใหม่...")
+                    clear_app(device)
+                    time.sleep(6)
+                    # เปลี่ยนจากการ return "fixid_complete" เป็นการ return "restart"
+                    return "restart"
+
+            # 4. ตรวจสอบ fixbuglogin.png (ต้องติดตามเวลา)
+            fixbug_pos = ImgSearchADB(adb_img, 'img/fixbuglogin.png')
+            if fixbug_pos:
+                found_any_image = True
+                current_image = 'fixbuglogin.png'
+                if fixbug_timer is None:
+                    fixbug_timer = time.time()
+                    print(f"พบ fixbuglogin บนอุปกรณ์ {device.serial} เริ่มนับเวลา 30 วินาที")
+                else:
+                    elapsed_time = time.time() - fixbug_timer
+                    if elapsed_time >= 30:
+                        print(f"เจอ fixbuglogin นานเกิน 30 วินาที กำลังเคลียร์แอปบนอุปกรณ์ {device.serial}")
+                        clear_app(device)
+                        time.sleep(6)
+                        fixbug_timer = None
+                    else:
+                        print(f"พบ fixbuglogin บนอุปกรณ์ {device.serial} - เหลือเวลาอีก {30 - elapsed_time:.1f} วินาที")
+            else:
+                fixbug_timer = None
+
+            # 5. ตรวจสอบ refresh.png และ check.png (ทำงานเป็นคู่)
+            refresh_pos = ImgSearchADB(adb_img, 'img/refresh.png')
+            if refresh_pos:
+                found_any_image = True
+                current_image = 'refresh.png'
+                
+                # ตรวจสอบการเจอ refresh ซ้ำ
+                if current_image == last_image:
+                    repeat_count['refresh'] = repeat_count.get('refresh', 0) + 1
+                    if repeat_count['refresh'] >= max_repeat:
+                        print(f"พบ refresh.png ซ้ำเกิน {max_repeat} ครั้ง - ข้ามไปตรวจสอบรูปอื่น")
+                        repeat_count['refresh'] = 0
+                        time.sleep(1)
+                        continue
+                else:
+                    repeat_count['refresh'] = 1
+
+                print(f"พบ 'refresh.png' บนอุปกรณ์ {device.serial} ที่ตำแหน่ง: {refresh_pos[0][0]}, {refresh_pos[0][1]}")
+                device.shell(f"input tap {refresh_pos[0][0]} {refresh_pos[0][1]}")
+                time.sleep(1)
+
+                # ตรวจสอบ check.png ทันทีหลังจากกด refresh
+                cap = device.screencap()
+                image = np.frombuffer(cap, dtype=np.uint8)
+                check_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                
+                check_pos = ImgSearchADB(check_img, 'img/check.png')
+                if check_pos:
+                    print(f"พบ 'check.png' หลังจากกด refresh บนอุปกรณ์ {device.serial}")
+                    device.shell(f"input tap {check_pos[0][0]} {check_pos[0][1]}")
+                    time.sleep(1)
+                no_image_timer = None
+
+            # 6. ตรวจสอบ link1.png (สำหรับการเชื่อมต่อ)
+            link1_pos = ImgSearchADB(adb_img, 'img/link1.png')
+            if link1_pos:
+                found_any_image = True
+                current_image = 'link1.png'
+                print(f"พบ 'link1.png' บนอุปกรณ์ {device.serial} ที่ตำแหน่ง: {link1_pos[0][0]}, {link1_pos[0][1]}")
+                device.shell(f"input tap {link1_pos[0][0]} {link1_pos[0][1]}")
+                time.sleep(1)
+                device.shell("input text https://lg-release-tracking-8080.gcld-line.com/tracking/v1.0/link/LGRGS/TRACKING-LINK-LGRGS-446d2883-5ac3-4c36-ba54-12045346e90c/click")
+                device.shell("input keyevent KEYCODE_ENTER")
+                time.sleep(1)
+                no_image_timer = None
+
+            # 7. ตรวจสอบ event.png และการกดปุ่ม BACK
+            event_pos = ImgSearchADB(adb_img, 'img/event.png')
+            if event_pos:
+                found_any_image = True
+                current_image = 'event.png'
+                print(f"พบ 'event.png' บนอุปกรณ์ {device.serial} ที่ตำแหน่ง: {event_pos[0][0]}, {event_pos[0][1]}")
+                device.shell(f"input tap {event_pos[0][0]} {event_pos[0][1]}")
+                no_image_timer = None
+                time.sleep(1)
+                back_press_mode = True
+                
+                # เริ่มกดปุ่ม BACK รัวๆ จนกว่าจะเจอ cancel.png
+                back_press_count = 0
+                while back_press_mode:
+                    cap = device.screencap()
+                    image = np.frombuffer(cap, dtype=np.uint8)
+                    check_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+                    
+                    cancel_pos = ImgSearchADB(check_img, 'img/cancel.png')
+                    if cancel_pos:
+                        print(f"พบ 'cancel.png' หลังจากกด BACK {back_press_count} ครั้ง บนอุปกรณ์ {device.serial}")
+                        device.shell(f"input tap {cancel_pos[0][0]} {cancel_pos[0][1]}")
+                        back_press_mode = False
+                        time.sleep(1)
+                        break
+                    
+                    device.shell("input keyevent KEYCODE_BACK")
+                    back_press_count += 1
+                    print(f"กด BACK ครั้งที่ {back_press_count} บนอุปกรณ์ {device.serial}")
+
+            # 8. ตรวจสอบรูปภาพทั่วไป
+            general_images = [
+                ('test.png', 'test'), ('ok.png', 'ok'), 
+                ('check.png', 'check'), ('closeapp.png', 'closeapp'),
+                ('okwhite.png', 'okwhite'), ('fixback.png', 'fixback'),
+                ('fixout.png', 'fixout'), ('fixok.png', 'fixok')
+            ]
+
+            for img_name, img_key in general_images:
+                pos_adb = ImgSearchADB(adb_img, f'img/{img_name}')
+                if pos_adb:
+                    found_any_image = True
+                    current_image = img_name
+                    
+                    # ตรวจสอบการเจอรูปซ้ำ
+                    if current_image == last_image:
+                        repeat_count[img_key] = repeat_count.get(img_key, 0) + 1
+                        if repeat_count[img_key] >= max_repeat:
+                            print(f"พบ {img_name} ซ้ำเกิน {max_repeat} ครั้ง - ข้ามไปตรวจสอบรูปอื่น")
+                            repeat_count[img_key] = 0
+                            continue
+                    else:
+                        repeat_count[img_key] = 1
+                    
+                    print(f"พบ '{img_name}' บนอุปกรณ์ {device.serial} ที่ตำแหน่ง: {pos_adb[0][0]}, {pos_adb[0][1]}")
+                    device.shell(f"input tap {pos_adb[0][0]} {pos_adb[0][1]}")
+                    no_image_timer = None
+                    time.sleep(1)
+                    break
+
+            # บันทึกรูปภาพล่าสุดที่เจอ
+            last_image = current_image
+
+            # ตรวจสอบกรณีไม่พบรูปภาพใดๆ
+            if not found_any_image:
+                if no_image_timer is None:
+                    no_image_timer = time.time()
+                    print(f"ไม่พบรูปภาพใดๆ บนอุปกรณ์ {device.serial} เริ่มนับเวลา 240 วินาที")
+                else:
+                    elapsed_time = time.time() - no_image_timer
+                    if elapsed_time >= 240:
+                        print(f"ไม่พบรูปภาพใดๆ นานเกิน 240 วินาที กำลังเคลียร์แอปบนอุปกรณ์ {device.serial}")
+                        clear_app(device)
+                        no_image_timer = None
+                    else:
+                        print(f"ไม่พบรูปภาพใดๆ บนอุปกรณ์ {device.serial} - เหลือเวลาอีก {240 - elapsed_time:.1f} วินาที")
+            else:
+                no_image_timer = None
+            
+            time.sleep(1)
+            
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาด: {e}")
+            time.sleep(1)
+    
+    return False
+
+def process_single_file_for_device(device):
+    """ฟังก์ชันสำหรับประมวลผลไฟล์สำหรับอุปกรณ์เดียว"""
+    try:
+        # อัพเดทคิวไฟล์ก่อนการประมวลผล
+        update_file_queue()
+        
+        # ถ้าไม่มีไฟล์ในคิว return False
+        if device_state.file_queue.empty():
+            return False
+
+        with device_state.lock:
+            # ดึงไฟล์จากคิว
+            xml_file = device_state.file_queue.get()
+            # เพิ่มไฟล์ลงในรายการที่ประมวลผลแล้ว
+            device_state.processed_files.add(xml_file)
+            # เก็บชื่อไฟล์ต้นฉบับ
+            device_state.original_filenames[device.serial] = xml_file
+
+        original_file_path = os.path.join(source_folder, xml_file)
+        device_specific_temp_file = f"_LINE_COCOS_PREF_KEY_{device.serial}.xml"
+        temp_file_path = os.path.join(source_folder, device_specific_temp_file)
+
+        # บันทึกเวลาและผู้ใช้
+        current_time = "2025-05-16 19:22:27"  # UTC time
+        current_user = "leokungYT"
+        print(f"\nDevice {device.serial}: === เริ่มประมวลผลไฟล์ ===")
+        print(f"เวลา (UTC): {current_time}")
+        print(f"ผู้ใช้งาน: {current_user}")
+        print(f"ไฟล์: {xml_file}")
+
+        # ตรวจสอบว่าไฟล์ต้นฉบับมีอยู่จริง
+        if not os.path.exists(original_file_path):
+            print(f"ไม่พบไฟล์ต้นฉบับ: {original_file_path}")
+            return False
+
+        # ดำเนินการกับไฟล์
+        try:
+            import shutil
+            print(f"กำลังประมวลผลไฟล์ {xml_file} สำหรับอุปกรณ์ {device.serial}")
+            
+            # ลบไฟล์ temporary เดิมถ้ามีอยู่
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except:
+                    time.sleep(1)  # รอสักครู่แล้วลองอีกครั้ง
+                    os.remove(temp_file_path)
+            
+            # คัดลอกไฟล์ไปยังไฟล์ temporary
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    shutil.copy2(original_file_path, temp_file_path)
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(1)
+
+            # ลบไฟล์ต้นฉบับหลังจากคัดลอกสำเร็จ
+            os.remove(original_file_path)
+
+            # ส่งไฟล์ไปยังอุปกรณ์
+            destination_path = "/data/data/com.linecorp.LGRGS/shared_prefs/"
+            
+            enable_root(device)
+            time.sleep(1)
+            
+            # ลบไฟล์เก่าบนอุปกรณ์
+            device.shell(f"rm -f {destination_path}_LINE_COCOS_PREF_KEY.xml")
+            
+            # สร้างและกำหนดสิทธิ์โฟลเดอร์
+            device.shell(f"mkdir -p {destination_path}")
+            device.shell(f"chmod 777 {destination_path}")
+            
+            # ส่งไฟล์
+            for attempt in range(max_retries):
+                try:
+                    push_command = f'adb -s {device.serial} push "{temp_file_path}" "{destination_path}_LINE_COCOS_PREF_KEY.xml"'
+                    result = subprocess.run(push_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    
+                    if "error" in result.stderr.lower() or result.returncode != 0:
+                        if attempt == max_retries - 1:
+                            raise Exception(result.stderr)
+                        time.sleep(1)
+                        continue
+                    break
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    time.sleep(1)
+                    
+            device.shell(f"chmod 666 {destination_path}_LINE_COCOS_PREF_KEY.xml")
+            
+            print(f"ส่งไฟล์ {xml_file} ไปยังอุปกรณ์ {device.serial} สำเร็จ")
+            
+            # ลบไฟล์ temporary
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except:
+                    pass
+            
+            return True
+
+        except Exception as e:
+            print(f"เกิดข้อผิดพลาดในการประมวลผลไฟล์สำหรับอุปกรณ์ {device.serial}: {e}")
+            if os.path.exists(temp_file_path):
+                try:
+                    os.remove(temp_file_path)
+                except:
+                    pass
+            return False
+
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการประมวลผลไฟล์: {e}")
+        return False
+
+
+def backup_failed_game_data(device):
+    """Backup game data to random-Fail folder when hero1.png is not found"""
+    try:
+        # สร้างโฟลเดอร์ random-Fail ถ้ายังไม่มี
+        random_fail_dir = "random-Fail"
+        if not os.path.exists(random_fail_dir):
+            os.makedirs(random_fail_dir)
+        
+        # ดึงชื่อไฟล์ต้นฉบับ
+        original_filename = device_state.original_filenames.get(device.serial)
+        if not original_filename:
+            print(f"ไม่พบชื่อไฟล์ต้นฉบับสำหรับอุปกรณ์ {device.serial}")
+            return False
+            
+        # สร้างพาธสำหรับไฟล์ backup
+        backup_path = os.path.join(random_fail_dir, original_filename)
+        
+        # ขอสิทธิ์ root และดึงไฟล์
+        try:
+            device.shell("su -c 'chmod 777 /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
+            device.shell("su -c 'chmod 777 /data/data/com.linecorp.LGRGS/shared_prefs'")
+        except Exception as e:
+            print(f"ไม่สามารถขอสิทธิ์ root ได้: {e}")
+
+        # ดึงไฟล์จากอุปกรณ์
+        try:
+            pull_command = f'adb -s {device.serial} pull "/data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml" "{os.path.abspath(backup_path)}"'
+            result = subprocess.run(
+                pull_command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode == 0 and os.path.exists(backup_path) and os.path.getsize(backup_path) > 0:
+                print(f"\nDevice {device.serial}: === Backup ไฟล์ที่ไม่พบ hero1.png สำเร็จ ===")
+                print(f"Device {device.serial}: Backup path: {backup_path}")
+                print(f"Device {device.serial}: File size: {os.path.getsize(backup_path)} bytes")
+                return True
+            else:
+                print(f"Device {device.serial}: Pull ไม่สำเร็จ: {result.stderr}")
+                return False
+
+        except Exception as e:
+            print(f"Device {device.serial}: เกิดข้อผิดพลาดในการ Pull: {e}")
+            return False
+
+    except Exception as e:
+        print(f"Device {device.serial}: เกิดข้อผิดพลาดในการ Backup: {e}")
+        return False
+
+def load_channel_config():
+    """Load channel configuration from config file"""
+    try:
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+        if not os.path.exists(config_path):
+            print(f"ไม่พบไฟล์ config.json กรุณาตรวจสอบไฟล์")
+            return None
+        
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            print("โหลดการตั้งค่าช่องสำเร็จ")
+            print(f"กำลังใช้ช่อง: {config['channel']}")
+            print(f"ตำแหน่ง: {config['channels'][config['channel']]}")
+            return config
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการโหลดไฟล์ config: {e}")
+        return None
+
+def get_channel_position():
+    """Get the current channel position from config"""
+    config = load_channel_config()
+    if config and 'channel' in config and 'channels' in config:
+        channel = config['channel']
+        if channel in config['channels']:
+            return config['channels'][channel]
+    return None
+
+def backup_game_data(device):
+    """Backup game data with sequential ID naming and detailed logging"""
+    try:
+        # กำหนดค่าคงที่
+        INITIAL_WAIT = 5
+        RESTART_DELAY = 10
+        MAX_RETRIES = 3
+        
+        # บันทึกเวลาเริ่มต้น
+        current_time = "2025-05-24 07:42:34"  # UTC time
+        current_user = "tablegub"
+        
+        print(f"\nDevice {device.serial}: === เริ่มกระบวนการ Backup ===")
+        print(f"Device {device.serial}: เวลาเริ่มต้น (UTC): {current_time}")
+        print(f"Device {device.serial}: ผู้ใช้งาน: {current_user}")
+        
+        # สร้างโฟลเดอร์ backup-id
+        backup_dir = "backup-id"
+        if not os.path.exists(backup_dir):
+            os.makedirs(backup_dir)
+            
+        # โหลด config สำหรับ filename prefix
+        try:
+            with open('config.json', 'r') as f:
+                config = json.load(f)
+            filename_prefix = config.get('filename_prefix', 'conyfly')
+        except:
+            filename_prefix = 'conyfly'  # ใช้ค่าเริ่มต้นถ้าไม่สามารถโหลด config ได้
+        
+        # ดึงชื่อไฟล์ต้นฉบับ
+        original_filename = device_state.original_filenames.get(device.serial)
+        if not original_filename:
+            print(f"Device {device.serial}: ไม่พบชื่อไฟล์ต้นฉบับ ใช้ชื่อเริ่มต้น")
+            # สร้างชื่อไฟล์แบบใหม่
+            next_id, _ = get_next_backup_id()
+            backup_filename = f"{filename_prefix}-id{next_id}_LINE_COCOS_PREF_KEY_{current_time}.xml"
+        else:
+            # ใช้ชื่อไฟล์เดิมและเพิ่ม prefix จาก config
+            filename_without_ext = os.path.splitext(original_filename)[0]
+            backup_filename = f"{filename_prefix}-{filename_without_ext}_{current_time}.xml"
+        
+        backup_path = os.path.join(backup_dir, backup_filename)
+        device_id = device.serial
+        
+        print(f"\nDevice {device.serial}: === ข้อมูล Backup ===")
+        print(f"Device {device.serial}: - ชื่อไฟล์ต้นฉบับ: {original_filename if original_filename else 'ไม่พบ'}")
+        print(f"Device {device.serial}: - ชื่อไฟล์ Backup: {backup_filename}")
+        print(f"Device {device.serial}: - Path: {backup_path}")
+        print(f"Device {device.serial}: - Device ID: {device_id}")
+        
+        # ขอสิทธิ์ root และคัดลอกไฟล์
+        print(f"\nDevice {device.serial}: กำลังขอสิทธิ์ root เพื่อ copy ไฟล์...")
+        try:
+            device.shell("su -c 'chmod 777 /data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml'")
+            device.shell("su -c 'chmod 777 /data/data/com.linecorp.LGRGS/shared_prefs'")
+        except Exception as e:
+            print(f"Device {device.serial}: ไม่สามารถขอสิทธิ์ root ได้: {e}")
+
+        print(f"\nDevice {device.serial}: กำลัง Pull ไฟล์...")
+        try:
+            # ใช้คำสั่ง adb pull โดยตรง
+            pull_command = f'adb -s {device_id} pull "/data/data/com.linecorp.LGRGS/shared_prefs/_LINE_COCOS_PREF_KEY.xml" "{os.path.abspath(backup_path)}"'
+            result = subprocess.run(
+                pull_command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30
+            )
+            
+            # ตรวจสอบผลลัพธ์
+            if result.returncode == 0 and os.path.exists(backup_path) and os.path.getsize(backup_path) > 0:
+                print(f"\nDevice {device.serial}: === Backup สำเร็จ ===")
+                print(f"Device {device.serial}: Backup path: {backup_path}")
+                print(f"Device {device.serial}: File size: {os.path.getsize(backup_path)} bytes")
+                print(f"Device {device.serial}: Backup filename: {backup_filename}")
+                
+                print(f"\nDevice {device.serial}: รอ {RESTART_DELAY} วินาทีก่อนเริ่มต้นใหม่...")
+                for i in range(RESTART_DELAY, 0, -1):
+                    print(f"Device {device.serial}: เหลือเวลา {i} วินาที")
+                    time.sleep(1)
+                
+                return True
+            else:
+                print(f"Device {device.serial}: Pull ไม่สำเร็จ: {result.stderr}")
+                return False
+
+        except Exception as e:
+            print(f"Device {device.serial}: เกิดข้อผิดพลาดในการ Pull: {e}")
+            return False
+
+    except Exception as e:
+        print(f"Device {device.serial}: เกิดข้อผิดพลาดในการ Backup: {e}")
+        return False
+
+def check_for_hero1(device):
+    """ฟังก์ชันตรวจสอบการมีอยู่ของ hero1.png"""
+    try:
+        print(f"กำลังค้นหา hero1.png บนอุปกรณ์ {device.serial}")
+        cap = device.screencap()
+        image = np.frombuffer(cap, dtype=np.uint8)
+        adb_img = cv2.imdecode(image, cv2.IMREAD_COLOR)
+        
+        hero_pos = ImgSearchADB(adb_img, 'img/hero1.png')
+        if hero_pos:
+            print(f"พบ hero1.png บนอุปกรณ์ {device.serial}")
+            return True
+        return False
+    except Exception as e:
+        print(f"เกิดข้อผิดพลาดในการค้นหา hero1.png: {e}")
+        return False
+
+def process_single_device(device):
+    """
+    ฟังก์ชันสำหรับประมวลผลอุปกรณ์แต่ละตัว
+    พารามิเตอร์:
+        device: อุปกรณ์ ADB ที่ต้องการประมวลผล
+    """
+    def adaptive_delay(base_delay=1.0, factor=1.0):
+        """ฟังก์ชันหน่วงเวลาแบบปรับตัวได้"""
+        try:
+            cpu_info = device.shell("dumpsys cpuinfo | grep TOTAL")
+            if "TOTAL" in cpu_info:
+                cpu_usage = float(cpu_info.split("%")[0].strip().split()[-1])
+                if cpu_usage > 80:
+                    time.sleep(base_delay * factor * 1.5)
+                elif cpu_usage > 50:
+                    time.sleep(base_delay * factor)
+                else:
+                    time.sleep(base_delay * factor * 0.8)
+            else:
+                time.sleep(base_delay * factor)
+        except:
+            time.sleep(base_delay * factor)
+
+    def cleanup_resources():
+        """ฟังก์ชันทำความสะอาดทรัพยากร"""
+        import gc
+        gc.collect()
+
+    def log_status(message, status_type="INFO"):
+        """
+        ฟังก์ชันบันทึกสถานะการทำงาน
+        พารามิเตอร์:
+            message: ข้อความที่ต้องการบันทึก
+            status_type: ประเภทของสถานะ (INFO, WARNING, ERROR)
+        """
+        current_time = "2025-05-16 19:22:27"  # UTC time
+        print(f"\n[{status_type}] [{current_time}] Device {device.serial}: {message}")
+
+    def check_device_connection():
+        """
+        ฟังก์ชันตรวจสอบการเชื่อมต่อของอุปกรณ์
+        คืนค่า: True ถ้าเชื่อมต่อได้, False ถ้าเชื่อมต่อไม่ได้
+        """
+        try:
+            device.shell("echo 'test connection'")
+            return True
+        except:
+            log_status("การเชื่อมต่อขาดหาย กำลังพยายามเชื่อมต่อใหม่...", "WARNING")
+            try:
+                subprocess.run(["adb", "connect", device.serial])
+                adaptive_delay(2.0)
+                device.shell("echo 'test connection'")
+                log_status("เชื่อมต่อใหม่สำเร็จ")
+                return True
+            except:
+                log_status("ไม่สามารถเชื่อมต่อใหม่ได้", "ERROR")
+                return False
+
+    # เริ่มการทำงานหลัก
+    while True:
+        try:
+            # แสดงข้อมูลเริ่มต้น
+            current_time = "2025-05-16 19:22:27"  # UTC time
+            current_user = "leokungYT"
+            log_status(f"""
+            === สถานะการทำงาน ===
+            เวลาปัจจุบัน (UTC): {current_time}
+            ผู้ใช้งาน: {current_user}
+            อุปกรณ์: {device.serial}
+            ======================
+            """)
+
+            # ตรวจสอบไฟล์ XML
+            if not has_xml_files():
+                log_status("ไม่มีไฟล์ XML รอ 5 วินาที...")
+                adaptive_delay(5.0)
+                continue
+
+            # ตรวจสอบ hero1.png
+            if check_for_hero1(device):
+                log_status("พบ hero1.png - ดำเนินการ backup ทันที")
+                backup_result = backup_game_data(device)
+                if backup_result:
+                    log_status("Backup สำเร็จ")
+                    clear_app(device)
+                    adaptive_delay(5.0)
+                    cleanup_resources()
+                    continue
+                else:
+                    log_status("Backup ล้มเหลว", "WARNING")
+                    adaptive_delay(5.0)
+                    continue
+            else:
+                log_status("ไม่พบ hero1.png - ดำเนินการต่อ")
+
+            # ประมวลผลไฟล์
+            if process_single_file_for_device(device):
+                log_status("เริ่มกระบวนการล็อกอิน")
+                
+                # ทำการล็อกอิน
+                login_result = main_login(device)
+                
+                if login_result == "restart":
+                    log_status("พบ fixid ครบ 8 รอบ กำลังเริ่มกระบวนการใหม่")
+                    cleanup_resources()
+                    continue
+                    
+                elif login_result == "normal_complete":
+                    # ทำ main_box
+                    log_status("เริ่มกระบวนการกล่อง")
+                    main_box(device)
+                    adaptive_delay(0.8)
+                    
+                    # ทำ swap_shop
+                    log_status("เริ่มกระบวนการ swap shop")
+                    swap_result = process_swap_shop(device)
+                    
+                    # ตรวจสอบและทำ backup หลังจาก swap_shop เสร็จถ้าไม่พบ hero1.png
+                    if not check_for_hero1(device):
+                        log_status("ยังไม่พบ hero1.png หลัง swap shop - ทำการ backup ไฟล์")
+                        backup_failed_game_data(device)
+                    
+                    # ทำความสะอาดและเริ่มใหม่
+                    cleanup_resources()
+                    log_status("กำลังเคลียร์แอปและเริ่มกระบวนการใหม่")
+                    clear_app(device)
+                    adaptive_delay(3.0)
+                    continue
+
+            else:
+                log_status("การประมวลผลไฟล์ล้มเหลว รอ 5 วินาที...", "WARNING")
+                adaptive_delay(5.0)
+                
+            # แสดงสถานะทุก 30 วินาที
+            if time.time() % 30 < 1:
+                current_time = "2025-05-16 19:22:27"  # UTC time
+                log_status(f"""
+=== อัพเดทสถานะ ===
+เวลา (UTC): {current_time}
+อุปกรณ์: {device.serial}
+==================
+                """)
+                cleanup_resources()
+
+        except Exception as e:
+            log_status(f"เกิดข้อผิดพลาดในการทำงาน: {str(e)}", "ERROR")
+            log_status("รอ 5 วินาทีก่อนเริ่มใหม่...", "WARNING")
+            adaptive_delay(5.0)
+            
+            # ตรวจสอบการเชื่อมต่อของอุปกรณ์
+            if not check_device_connection():
+                log_status("รอ 5 วินาทีก่อนลองใหม่...", "WARNING")
+                adaptive_delay(5.0)
+                continue
+
+            cleanup_resources()
+
+def get_connected_devices():
+    try:
+        devices = connect_mumu_devices()
+        time.sleep(1)
+        
+        result = subprocess.run(["adb", "devices"], stdout=subprocess.PIPE, text=True)
+        lines = result.stdout.strip().split("\n")[1:]
+        adb_devices = [line.split("\t")[0] for line in lines if "device" in line]
+        
+        all_devices = list(set(adb_devices + devices))
+        
+        if all_devices:
+            print(f"พบอุปกรณ์ทั้งหมด: {all_devices}")
+        else:
+            print("ไม่พบอุปกรณ์ที่เชื่อมต่อ")
+        
+        return all_devices
+    except Exception as e:
+        print(f"ไม่สามารถดึงรายการอุปกรณ์ได้: {e}")
+        return []
+
+def Main():
+    print("เริ่มต้นโปรแกรม...")
+    
+    while True:
+        try:
+            if not check_adb_available():
+                print("ไม่พบ ADB กรุณาตรวจสอบการติดตั้ง")
+                time.sleep(5)
+                continue
+
+            adb = AdbClient(host="127.0.0.1", port=5037)
+            devices = adb.devices()
+            
+            if not devices:
+                print("ไม่พบอุปกรณ์ที่เชื่อมต่อ กำลังรอ...")
+                time.sleep(5)
+                continue
+            
+            print(f"พบอุปกรณ์: {[device.serial for device in devices]}")
+            
+            threads = []
+            for device in devices:
+                thread = Thread(target=process_single_device, args=(device,))
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
+            
+            for thread in threads:
+                thread.join()
+
+        except KeyboardInterrupt:
+            print("\nกำลังปิดโปรแกรม...")
+            break
+        except Exception as e:
+            print(f"\nเกิดข้อผิดพลาดในการทำงาน: {e}")
+            print("กำลังเริ่มต้นใหม่...")
+            time.sleep(5)
+
+if __name__ == '__main__':
+    Main()
